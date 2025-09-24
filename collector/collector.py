@@ -4,6 +4,7 @@ import json
 import socket
 import requests
 import urllib3
+import random
 from datetime import datetime, timezone
 
 # Disable SSL warnings
@@ -11,11 +12,22 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 PUSH_ENDPOINT = os.getenv("PUSH_ENDPOINT", "http://aggregator:8080/metrics")
 INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "30"))
+JITTER_PERCENT = float(os.getenv("JITTER_PERCENT", "20"))  # +/- 20% jitter by default
+MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5"))  # Exit after 5 consecutive failures
 KUBELET_ENDPOINT = os.getenv("KUBELET_ENDPOINT", "https://127.0.0.1:10250/stats/summary")
 
 # Kubernetes mounts these into every pod
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+
+def get_randomized_interval():
+    """
+    Return a randomized interval with jitter to prevent thundering herd.
+    Applies +/- JITTER_PERCENT variance to the base INTERVAL.
+    """
+    jitter_range = INTERVAL * (JITTER_PERCENT / 100)
+    jitter = random.uniform(-jitter_range, jitter_range)
+    return max(1, INTERVAL + jitter)  # Ensure minimum 1 second interval
 
 def get_token():
     with open(TOKEN_PATH, "r") as f:
@@ -31,10 +43,10 @@ def fetch_kubelet_summary(token):
             timeout=5
         )
         resp.raise_for_status()
-        return resp.json()
+        return resp.json(), True
     except Exception as e:
         print(f"Error fetching kubelet summary: {e}")
-        return None
+        return None, False
 
 def parse_summary(summary):
     node_name = summary["node"]["nodeName"]
@@ -50,6 +62,19 @@ def parse_summary(summary):
         net_tx = int(pod.get("network", {}).get("txBytes", 0))
         net_rx = int(pod.get("network", {}).get("rxBytes", 0))
 
+        # Find earliest container start time
+        earliest_start_time = None
+        for container in pod.get("containers", []):
+            start_time_str = container.get("startTime")
+            if start_time_str:
+                try:
+                    start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                    if earliest_start_time is None or start_time < earliest_start_time:
+                        earliest_start_time = start_time
+                except ValueError:
+                    # Skip invalid timestamps
+                    continue
+
         pods_data.append({
             "pod_id": pod_id,
             "namespace": namespace,
@@ -57,7 +82,8 @@ def parse_summary(summary):
             "cpu_cores_used": cpu_nano / 1e9,
             "mem_gb_used": mem_bytes / (1024**3),
             "net_tx_bytes": net_tx,
-            "net_rx_bytes": net_rx
+            "net_rx_bytes": net_rx,
+            "pod_start_time": earliest_start_time.isoformat() if earliest_start_time else None
         })
 
     return {
@@ -69,22 +95,51 @@ def parse_summary(summary):
 
 def push_metrics(payload):
     try:
-        print(f"Pushing metrics: {json.dumps(payload)}")
         headers = {"Content-Type": "application/json"}
         resp = requests.post(PUSH_ENDPOINT, headers=headers, data=json.dumps(payload), verify=False, timeout=5)
         resp.raise_for_status()
         print(f"Pushed {len(payload['pods'])} pod metrics")
+        return True
     except Exception as e:
         print(f"Error pushing metrics: {e}")
+        return False
 
 def main():
+    # Add initial random delay to spread out collector start times
+    initial_delay = random.uniform(0, INTERVAL)
+    print(f"Starting collector with initial delay of {initial_delay:.2f} seconds")
+    print(f"Will exit after {MAX_CONSECUTIVE_FAILURES} consecutive failures")
+    time.sleep(initial_delay)
+    
     token = get_token()
+    consecutive_failures = 0
+    
     while True:
-        summary = fetch_kubelet_summary(token)
-        if summary:
+        success = False
+        
+        # Try to fetch kubelet summary
+        summary, fetch_success = fetch_kubelet_summary(token)
+        if fetch_success and summary:
+            # Try to parse and push metrics
             payload = parse_summary(summary)
-            push_metrics(payload)
-        time.sleep(INTERVAL)
+            if push_metrics(payload):
+                success = True
+        
+        # Track consecutive failures
+        if success:
+            consecutive_failures = 0
+        else:
+            consecutive_failures += 1
+            print(f"Consecutive failures: {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES}")
+            
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                print(f"Reached maximum consecutive failures ({MAX_CONSECUTIVE_FAILURES}). Exiting.")
+                exit(1)
+        
+        # Use randomized interval for next iteration
+        sleep_time = get_randomized_interval()
+        print(f"Sleeping for {sleep_time:.2f} seconds until next collection")
+        time.sleep(sleep_time)
 
 if __name__ == "__main__":
     main()

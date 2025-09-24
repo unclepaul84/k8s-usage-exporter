@@ -1,0 +1,7 @@
+# Requirements for Iceberg Parquet attachment script
+pyiceberg==0.6.1
+pyarrow>=14.0.0
+pandas>=2.0.0
+boto3>=1.28.0
+botocore>=1.31.0
+requests>=2.31.0

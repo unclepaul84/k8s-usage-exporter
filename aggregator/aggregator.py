@@ -2,11 +2,162 @@ from flask import Flask, request, jsonify
 from kubernetes import client, config, watch
 import threading
 import urllib3
+import os
+import boto3
+import pandas as pd
+import logging
+from datetime import datetime
+from io import BytesIO
+from botocore.exceptions import ClientError
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = Flask(__name__)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# S3 Configuration
+S3_BUCKET = os.getenv("S3_BUCKET", "k8s-usage-data")
+S3_PREFIX = os.getenv("S3_PREFIX", "k8s-metrics/{cluster_name}/{date}/")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")  # Custom S3 endpoint (e.g., MinIO, LocalStack)
+
+# Initialize S3 client
+s3_client = None
+
+def initialize_s3_client():
+    """Initialize S3 client with proper configuration."""
+    global s3_client
+    #try:
+        # Configure S3 client with optional custom endpoint
+    s3_config = {
+        'region_name': AWS_REGION,
+        'config': boto3.session.Config(signature_version='s3v4'),
+        'verify': False  # Disable SSL verification for custom endpoints
+    }
+    
+    if AWS_ENDPOINT_URL:
+        s3_config['endpoint_url'] = AWS_ENDPOINT_URL
+        logger.info(f"Using custom S3 endpoint: {AWS_ENDPOINT_URL}")
+    
+    s3_client = boto3.client('s3', **s3_config)
+    
+    # Test S3 connection
+    #s3_client.head_bucket(Bucket=S3_BUCKET)
+    
+    endpoint_info = f" with endpoint {AWS_ENDPOINT_URL}" if AWS_ENDPOINT_URL else ""
+    logger.info(f"S3 client initialized successfully for bucket: {S3_BUCKET}{endpoint_info}")
+        
+    """ except ClientError as e:
+    logger.error(f"Failed to initialize S3 client: {e}")
+    s3_client = None
+except Exception as e:
+    logger.error(f"Unexpected error initializing S3 client: {e}")
+    s3_client = None"""
+
+def convert_to_parquet(payload):
+    """Convert enriched payload to parquet format."""
+    try:
+        # Flatten the payload for better parquet structure
+        records = []
+        
+        for pod in payload.get("pods", []):
+            # Extract nested data
+            requests = pod.get("requests", {})
+            limits = pod.get("limits", {})
+            labels = pod.get("labels", {})
+            annotations = pod.get("annotations", {})
+            
+            # Create flattened record
+            record = {
+                "timestamp": payload["timestamp"],
+                "cluster_id": payload["cluster_id"],
+                "node_name": payload["node_name"],
+                "ec2_instance_id": payload["ec2_instance_id"],
+                "pod_id": pod.get("pod_id"),
+                "namespace": pod.get("namespace"),
+                "owner": pod.get("owner"),
+                "node": pod.get("node"),
+                "cpu_usage_cores": pod.get("cpu_usage_cores"),
+                "memory_usage_bytes": pod.get("memory_usage_bytes"),
+                "requests_cpu_millicores": requests.get("cpu_millicores", 0),
+                "requests_memory_bytes": requests.get("memory_bytes", 0),
+                "requests_storage_bytes": requests.get("storage_bytes", 0),
+                "limits_cpu_millicores": limits.get("cpu_millicores", 0),
+                "limits_memory_bytes": limits.get("memory_bytes", 0),
+                "limits_storage_bytes": limits.get("storage_bytes", 0),
+                # Convert labels and annotations to strings for parquet compatibility
+                "labels_json": str(labels),
+                "annotations_json": str(annotations)
+            }
+            
+            # Add PVC information if available
+            pvcs = pod.get("pvcs", [])
+            if pvcs:
+                record["pvc_count"] = len(pvcs)
+                record["total_pvc_storage_bytes"] = sum(pvc.get("storage_request_bytes", 0) for pvc in pvcs)
+                record["pvc_names"] = ",".join(pvc.get("pvc_name", "") for pvc in pvcs)
+                record["aws_volume_ids"] = ",".join(pvc.get("aws_volume_id", "") for pvc in pvcs if pvc.get("aws_volume_id"))
+            else:
+                record["pvc_count"] = 0
+                record["total_pvc_storage_bytes"] = 0
+                record["pvc_names"] = ""
+                record["aws_volume_ids"] = ""
+                
+            records.append(record)
+        
+        # Convert to DataFrame
+        df = pd.DataFrame(records)
+        
+        # Convert to parquet bytes
+        parquet_buffer = BytesIO()
+        df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
+        parquet_buffer.seek(0)
+        
+        return parquet_buffer.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Failed to convert payload to parquet: {e}")
+        return None
+
+def upload_to_s3(parquet_data, cluster_id, node_name):
+    """Upload parquet data to S3 with proper prefix."""
+    if not s3_client or not parquet_data:
+        logger.warning("S3 client not available or no data to upload")
+        return False
+        
+    try:
+        # Generate S3 key with cluster name and date
+        current_date = datetime.utcnow().strftime("%Y-%m-%d")
+        current_timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        
+        # Format the prefix
+        formatted_prefix = S3_PREFIX.format(
+            cluster_name=cluster_id,
+            date=current_date
+        )
+        
+        # Create the full S3 key
+        s3_key = f"{formatted_prefix}metrics_{node_name}_{current_timestamp}.parquet"
+        
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=s3_key,
+            Body=parquet_data,
+            ContentType='application/octet-stream'
+        )
+        
+        logger.info(f"Successfully uploaded metrics to S3: s3://{S3_BUCKET}/{s3_key}")
+        return True
+        
+    except ClientError as e:
+        logger.error(f"Failed to upload to S3: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error uploading to S3: {e}")
+        return False
 
 # Caches
 pod_cache = {}    # pod_uid → metadata + requests/limits
@@ -135,36 +286,72 @@ def watch_pvs():
             "storage_class": pv.spec.storage_class_name
         }
 
-@app.route("/metrics", methods=["POST"])
-def receive_metrics():
-    payload = request.get_json(force=True)
-    node_name = payload.get("node_name")
-    ec2_instance_id = node_cache.get(node_name)
-
-    enriched_pods = []
-    for pod in payload.get("pods", []):
-        uid = pod["pod_id"]
-        meta = pod_cache.get(uid, {})
-        enriched_pods.append({
-            **pod,
-            **meta,
-            "ec2_instance_id": ec2_instance_id
-        })
-
-    enriched_payload = {
-        "timestamp": payload["timestamp"],
-        "node_name": node_name,
-        "ec2_instance_id": ec2_instance_id,
-        "pods": enriched_pods
-    }
-
-    # TODO: push to DB or message bus
-    print(enriched_payload)
-    return jsonify({"status": "ok"}), 200
-
-if __name__ == "__main__":
+def start_background_watchers():
+    """Start all Kubernetes watchers as background threads."""
     threading.Thread(target=watch_nodes, daemon=True).start()
     threading.Thread(target=watch_pods, daemon=True).start()
     threading.Thread(target=watch_pvcs, daemon=True).start()
     threading.Thread(target=watch_pvs, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+
+def create_app():
+    
+    # Initialize S3 client
+    initialize_s3_client()
+    
+    # Start background watchers when app is created
+    start_background_watchers()
+
+    """Create and configure the Flask app."""
+    app = Flask(__name__)
+    
+
+    @app.route("/metrics", methods=["POST"])
+    def receive_metrics():
+        payload = request.get_json(force=True)
+        node_name = payload.get("node_name")
+        ec2_instance_id = node_cache.get(node_name)
+        cluster_id = os.getenv("CLUSTER_ID", "unknown")
+
+        enriched_pods = []
+        for pod in payload.get("pods", []):
+            uid = pod["pod_id"]
+            meta = pod_cache.get(uid, {})
+            enriched_pods.append({
+                **pod,
+                **meta,
+                "ec2_instance_id": ec2_instance_id
+            })
+
+        enriched_payload = {
+            "timestamp": payload["timestamp"],
+            "cluster_id": cluster_id,
+            "node_name": node_name,
+            "ec2_instance_id": ec2_instance_id,
+            "pods": enriched_pods
+        }
+
+        # Convert to parquet and upload to S3
+        parquet_data = convert_to_parquet(enriched_payload)
+        if parquet_data:
+            upload_success = upload_to_s3(parquet_data, cluster_id,node_name)
+            if upload_success:
+                logger.info(f"Successfully processed and uploaded metrics for cluster {cluster_id}")
+            else:
+                logger.warning(f"Failed to upload metrics to S3 for cluster {cluster_id}")
+        else:
+            logger.error(f"Failed to convert metrics to parquet for cluster {cluster_id}")
+        
+        # Also log for debugging
+        logger.debug(f"Processed metrics payload: {enriched_payload}")
+        return jsonify({"status": "ok"}), 200
+    return app
+
+# WSGI application entry point
+app = create_app()
+
+if __name__ == "__main__":
+    # For standalone execution (development/testing)
+    app = create_app()
+    app.run(host="0.0.0.0", port=8888)
+
+

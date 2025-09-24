@@ -1,3 +1,7 @@
 kubernetes
 flask
 requests
+gunicorn
+boto3
+pandas
+pyarrow

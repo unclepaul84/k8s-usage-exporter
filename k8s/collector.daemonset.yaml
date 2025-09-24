@@ -22,7 +22,7 @@ spec:
         imagePullPolicy: Always
         env:
         - name: PUSH_ENDPOINT
-          value: "http://aggregator.kube-system.svc.cluster.local:8080/metrics"
+          value: "http://aggregator.kube-system.svc.cluster.local:8888/metrics"
         - name: SCRAPE_INTERVAL
           value: "30"
         - name: KUBELET_ENDPOINT
