@@ -1,21 +1,26 @@
-# Use Python 3.11 slim image as base
+# Multi-architecture Python image (supports linux/amd64, linux/arm64)
 FROM python:3.11-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements file
+# Copy and install Python dependencies first (better layer caching)
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the aggregator script, configuration, and schema
+# Copy the aggregator files
 COPY aggregator.py .
 COPY gunicorn.conf.py .
 COPY payload_schema.json .
 
-# Expose port 8080 for the Flask app
+# Create non-root user for security
+RUN groupadd -r aggregator && useradd -r -g aggregator aggregator
+
+# Change ownership of app directory
+RUN chown -R aggregator:aggregator /app
+USER aggregator
+
+# Expose port 8888 for the Flask app
 EXPOSE 8888
 
 # Run the aggregator Flask service with Gunicorn

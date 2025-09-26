@@ -2,6 +2,15 @@
 
 This directory contains Kubernetes deployment configurations for the k8s-usage-exporter components.
 
+## Multi-Architecture Support
+
+The k8s-usage-exporter images support both AMD64 and ARM64 architectures:
+- Images automatically work on Intel/AMD and ARM-based Kubernetes nodes
+- No configuration changes needed - Kubernetes pulls the correct architecture automatically
+- Supports AWS Graviton, Apple Silicon, and traditional x86 hardware
+
+For building multi-architecture images, see [MULTIARCH_BUILD_GUIDE.md](../MULTIARCH_BUILD_GUIDE.md).
+
 ## Files
 
 ### `aggregator.yaml`

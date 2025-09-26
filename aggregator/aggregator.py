@@ -421,7 +421,9 @@ def create_app():
         
         # Use cluster name from node annotation, fallback to environment variable
         cluster_id = node_info.get("cluster_name") or os.getenv("CLUSTER_NAME", "unknown")
-
+        if( cluster_id == "unknown" ):
+            logger.warning(f"Cluster name not found in node annotations or environment variable. Please configure CLUSTER_NAME env var.")
+        
         enriched_pods = []
         for pod in payload.get("pods", []):
             uid = pod["pod_id"]
