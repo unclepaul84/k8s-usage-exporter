@@ -15,6 +15,8 @@ INTERVAL = int(os.getenv("SCRAPE_INTERVAL", "30"))
 JITTER_PERCENT = float(os.getenv("JITTER_PERCENT", "20"))  # +/- 20% jitter by default
 MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5"))  # Exit after 5 consecutive failures
 KUBELET_ENDPOINT = os.getenv("KUBELET_ENDPOINT", "https://127.0.0.1:10250/stats/summary")
+ENABLE_EC2_INSTANCE_ID = os.getenv("ENABLE_EC2_INSTANCE_ID", "true").lower() == "true"
+EC2_METADATA_ENDPOINT = "http://169.254.169.254/latest/meta-data/instance-id"
 
 # Kubernetes mounts these into every pod
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -33,6 +35,27 @@ def get_token():
     with open(TOKEN_PATH, "r") as f:
         return f.read().strip()
 
+def get_ec2_instance_id():
+    """
+    Fetch EC2 instance ID from AWS metadata endpoint.
+    Returns None if the endpoint is not available or times out.
+    """
+    if not ENABLE_EC2_INSTANCE_ID:
+        return None
+        
+    try:
+        resp = requests.get(
+            EC2_METADATA_ENDPOINT,
+            timeout=2  # Short timeout since this is a local endpoint
+        )
+        resp.raise_for_status()
+        instance_id = resp.text.strip()
+        print(f"Retrieved EC2 instance ID: {instance_id}")
+        return instance_id
+    except Exception as e:
+        print(f"Failed to retrieve EC2 instance ID: {e}")
+        return None
+
 def fetch_kubelet_summary(token):
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -48,7 +71,7 @@ def fetch_kubelet_summary(token):
         print(f"Error fetching kubelet summary: {e}")
         return None, False
 
-def parse_summary(summary):
+def parse_summary(summary, ec2_instance_id=None):
     node_name = summary["node"]["nodeName"]
     pods_data = []
 
@@ -79,19 +102,25 @@ def parse_summary(summary):
             "pod_id": pod_id,
             "namespace": namespace,
             "name": name,
-            "cpu_cores_used": cpu_nano / 1e9,
-            "mem_gb_used": mem_bytes / (1024**3),
+            "cpu_usage_cores": cpu_nano / 1e9,
+            "memory_usage_bytes": mem_bytes,
             "net_tx_bytes": net_tx,
             "net_rx_bytes": net_rx,
             "pod_start_time": earliest_start_time.isoformat() if earliest_start_time else None
         })
 
-    return {
+    payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "node_name": node_name,
         "hostname": socket.gethostname(),
         "pods": pods_data
     }
+    
+    # Add EC2 instance ID if available
+    if ec2_instance_id:
+        payload["ec2_instance_id"] = ec2_instance_id
+    
+    return payload
 
 def push_metrics(payload):
     try:
@@ -109,10 +138,14 @@ def main():
     initial_delay = random.uniform(0, INTERVAL)
     print(f"Starting collector with initial delay of {initial_delay:.2f} seconds")
     print(f"Will exit after {MAX_CONSECUTIVE_FAILURES} consecutive failures")
+    print(f"EC2 instance ID collection: {'enabled' if ENABLE_EC2_INSTANCE_ID else 'disabled'}")
     time.sleep(initial_delay)
     
     token = get_token()
     consecutive_failures = 0
+    
+    # Get EC2 instance ID once at startup (it doesn't change)
+    ec2_instance_id = get_ec2_instance_id() if ENABLE_EC2_INSTANCE_ID else None
     
     while True:
         success = False
@@ -121,7 +154,7 @@ def main():
         summary, fetch_success = fetch_kubelet_summary(token)
         if fetch_success and summary:
             # Try to parse and push metrics
-            payload = parse_summary(summary)
+            payload = parse_summary(summary, ec2_instance_id)
             if push_metrics(payload):
                 success = True
         

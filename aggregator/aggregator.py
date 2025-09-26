@@ -6,9 +6,11 @@ import os
 import boto3
 import pandas as pd
 import logging
+import json
 from datetime import datetime
 from io import BytesIO
 from botocore.exceptions import ClientError
+from jsonschema import validate, ValidationError
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -19,12 +21,48 @@ logger = logging.getLogger(__name__)
 
 # S3 Configuration
 S3_BUCKET = os.getenv("S3_BUCKET", "k8s-usage-data")
-S3_PREFIX = os.getenv("S3_PREFIX", "k8s-metrics/{cluster_name}/{date}/")
+S3_PREFIX = os.getenv("S3_PREFIX", "k8s-metrics/")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 AWS_ENDPOINT_URL = os.getenv("AWS_ENDPOINT_URL")  # Custom S3 endpoint (e.g., MinIO, LocalStack)
 
+# Load JSON Schema for payload validation
+def load_payload_schema():
+    """Load the JSON schema from file."""
+    schema_path = os.path.join(os.path.dirname(__file__), 'payload_schema.json')
+    try:
+        with open(schema_path, 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.error(f"Schema file not found at {schema_path}")
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Invalid JSON in schema file: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error loading schema file: {e}")
+        return None
+
+# Load schema at startup
+PAYLOAD_SCHEMA = load_payload_schema()
+
 # Initialize S3 client
 s3_client = None
+
+def validate_payload(payload):
+    """
+    Validate incoming payload against the expected schema.
+    Returns (is_valid, errors) tuple.
+    """
+    if PAYLOAD_SCHEMA is None:
+        return True, ["Schema not loaded, skipping validation"]
+    
+    try:
+        validate(instance=payload, schema=PAYLOAD_SCHEMA)
+        return True, []
+    except ValidationError as e:
+        return False, [str(e)]
+    except Exception as e:
+        return False, [f"Unexpected validation error: {str(e)}"]
 
 def initialize_s3_client():
     """Initialize S3 client with proper configuration."""
@@ -81,15 +119,18 @@ def convert_to_parquet(payload):
                 "node": pod.get("node"),
                 "cpu_usage_cores": pod.get("cpu_usage_cores"),
                 "memory_usage_bytes": pod.get("memory_usage_bytes"),
+                "net_tx_bytes": pod.get("net_tx_bytes", 0),
+                "net_rx_bytes": pod.get("net_rx_bytes", 0),
+                "pod_start_time": pod.get("pod_start_time"),
                 "requests_cpu_millicores": requests.get("cpu_millicores", 0),
                 "requests_memory_bytes": requests.get("memory_bytes", 0),
                 "requests_storage_bytes": requests.get("storage_bytes", 0),
                 "limits_cpu_millicores": limits.get("cpu_millicores", 0),
                 "limits_memory_bytes": limits.get("memory_bytes", 0),
                 "limits_storage_bytes": limits.get("storage_bytes", 0),
-                # Convert labels and annotations to strings for parquet compatibility
-                "labels_json": str(labels),
-                "annotations_json": str(annotations)
+                # Convert labels and annotations to arrays of strings for parquet compatibility
+                "labels": [f"{k}={v}" for k, v in labels.items()] if labels else [],
+                "annotations": [f"{k}={v}" for k, v in annotations.items()] if annotations else []
             }
             
             # Add PVC information if available
@@ -97,13 +138,13 @@ def convert_to_parquet(payload):
             if pvcs:
                 record["pvc_count"] = len(pvcs)
                 record["total_pvc_storage_bytes"] = sum(pvc.get("storage_request_bytes", 0) for pvc in pvcs)
-                record["pvc_names"] = ",".join(pvc.get("pvc_name", "") for pvc in pvcs)
-                record["aws_volume_ids"] = ",".join(pvc.get("aws_volume_id", "") for pvc in pvcs if pvc.get("aws_volume_id"))
+                record["pvc_names"] = [pvc.get("pvc_name", "") for pvc in pvcs if pvc.get("pvc_name")]
+                record["aws_volume_ids"] = [pvc.get("aws_volume_id", "") for pvc in pvcs if pvc.get("aws_volume_id")]
             else:
                 record["pvc_count"] = 0
                 record["total_pvc_storage_bytes"] = 0
-                record["pvc_names"] = ""
-                record["aws_volume_ids"] = ""
+                record["pvc_names"] = []
+                record["aws_volume_ids"] = []
                 
             records.append(record)
         
@@ -135,11 +176,12 @@ def upload_to_s3(parquet_data, cluster_id, node_name):
         # Format the prefix
         formatted_prefix = S3_PREFIX.format(
             cluster_name=cluster_id,
-            date=current_date
+            date=current_date,
+            node_name=node_name
         )
         
         # Create the full S3 key
-        s3_key = f"{formatted_prefix}metrics_{node_name}_{current_timestamp}.parquet"
+        s3_key = f"{formatted_prefix}cluster_id={cluster_id}/year={datetime.utcnow().strftime('%Y')}/month={datetime.utcnow().strftime('%m')}/day={datetime.utcnow().strftime('%d')}/metrics_{cluster_id}_{node_name}_{current_timestamp}.parquet"
         
         # Upload to S3
         s3_client.put_object(
@@ -161,7 +203,7 @@ def upload_to_s3(parquet_data, cluster_id, node_name):
 
 # Caches
 pod_cache = {}    # pod_uid → metadata + requests/limits
-node_cache = {}   # node_name → ec2_instance_id
+node_cache = {}   # node_name → {ec2_instance_id, cluster_name}
 pvc_cache = {}    # pvc_uid → {namespace, name, storage_request_bytes, volume_name}
 pv_cache = {}     # pv_name → {aws_volume_id, storage_class}
 
@@ -190,10 +232,20 @@ def watch_nodes():
         node = event['object']
         node_name = node.metadata.name
         provider_id = node.spec.provider_id
+        annotations = node.metadata.annotations or {}
+        
+        # Extract EC2 instance ID from provider ID
         ec2_instance_id = None
         if provider_id and provider_id.startswith("aws:///"):
             ec2_instance_id = provider_id.split("/")[-1]
-        node_cache[node_name] = ec2_instance_id
+            
+        # Extract cluster name from annotation
+        cluster_name = annotations.get("cluster.x-k8s.io/cluster-name")
+        
+        node_cache[node_name] = {
+            "ec2_instance_id": ec2_instance_id,
+            "cluster_name": cluster_name
+        }
 
 def watch_pods():
     config.load_incluster_config()
@@ -308,9 +360,26 @@ def create_app():
     @app.route("/metrics", methods=["POST"])
     def receive_metrics():
         payload = request.get_json(force=True)
+        
+        # Validate payload schema
+        is_valid, validation_errors = validate_payload(payload)
+        if not is_valid:
+            logger.warning(f"Payload schema validation failed: {validation_errors}")
+            logger.warning(f"Invalid payload structure from {request.remote_addr}")
+            # Continue processing despite validation errors (non-blocking)
+        else:
+            logger.debug("Payload schema validation passed")
+        
         node_name = payload.get("node_name")
-        ec2_instance_id = node_cache.get(node_name)
-        cluster_id = os.getenv("CLUSTER_ID", "unknown")
+        
+        # Get node information from cache
+        node_info = node_cache.get(node_name, {})
+        
+        # Use EC2 instance ID from collector payload, fallback to node cache
+        ec2_instance_id = payload.get("ec2_instance_id") or node_info.get("ec2_instance_id")
+        
+        # Use cluster name from node annotation, fallback to environment variable
+        cluster_id = node_info.get("cluster_name") or os.getenv("CLUSTER_ID", "unknown")
 
         enriched_pods = []
         for pod in payload.get("pods", []):

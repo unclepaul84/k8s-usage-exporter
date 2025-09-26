@@ -1,0 +1,102 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Kubernetes Usage Metrics Payload",
+  "description": "Schema for validating incoming metrics payload from collectors",
+  "type": "object",
+  "required": [
+    "timestamp",
+    "node_name",
+    "hostname",
+    "pods"
+  ],
+  "properties": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp when metrics were collected"
+    },
+    "node_name": {
+      "type": "string",
+      "description": "Kubernetes node name where collector is running"
+    },
+    "hostname": {
+      "type": "string",
+      "description": "Hostname of the collector node"
+    },
+    "ec2_instance_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "AWS EC2 instance ID if running on EC2"
+    },
+    "pods": {
+      "type": "array",
+      "description": "Array of pod metrics collected from kubelet",
+      "items": {
+        "type": "object",
+        "required": [
+          "pod_id",
+          "namespace",
+          "name"
+        ],
+        "properties": {
+          "pod_id": {
+            "type": "string",
+            "description": "Kubernetes pod UID"
+          },
+          "namespace": {
+            "type": "string",
+            "description": "Kubernetes namespace containing the pod"
+          },
+          "name": {
+            "type": "string",
+            "description": "Pod name"
+          },
+          "cpu_usage_cores": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "CPU usage in cores (decimal)"
+          },
+          "memory_usage_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Memory usage in bytes"
+          },
+          "net_tx_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Network bytes transmitted"
+          },
+          "net_rx_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Network bytes received"
+          },
+          "pod_start_time": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "ISO 8601 timestamp when pod started"
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}

@@ -10,9 +10,10 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the aggregator script and configuration
+# Copy the aggregator script, configuration, and schema
 COPY aggregator.py .
 COPY gunicorn.conf.py .
+COPY payload_schema.json .
 
 # Expose port 8080 for the Flask app
 EXPOSE 8888
