@@ -15,9 +15,24 @@ from jsonschema import validate, ValidationError
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# Debug mode configuration
+DEBUG_K8S_API = os.getenv("DEBUG_K8S_API", "false").lower() == "true"
+
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG if DEBUG_K8S_API else logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configure Kubernetes client logging if debug mode is enabled
+if DEBUG_K8S_API:
+    # Enable debug logging for urllib3 to see HTTP requests/responses
+    logging.getLogger("urllib3").setLevel(logging.DEBUG)
+    # Enable debug logging for Kubernetes client
+    logging.getLogger("kubernetes").setLevel(logging.DEBUG)
+    logger.info("Debug mode enabled: All Kubernetes API responses will be logged")
+else:
+    # Keep urllib3 quiet in non-debug mode
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("kubernetes").setLevel(logging.WARNING)
 
 # S3 Configuration
 S3_BUCKET = os.getenv("S3_BUCKET", "k8s-usage-data")
@@ -230,6 +245,30 @@ def parse_quantity(qty: str) -> int:
         return int(q[:-2]) * 1024 * 1024 * 1024
     return int(q)
 
+def log_k8s_api_response(operation, obj_type, obj_name, event_type=None, full_object=None):
+    """Log Kubernetes API response details when debug mode is enabled."""
+    if not DEBUG_K8S_API:
+        return
+        
+    log_msg = f"K8S API [{operation}] {obj_type}: {obj_name}"
+    if event_type:
+        log_msg += f" (event: {event_type})"
+    
+    logger.debug(log_msg)
+    
+    if full_object and DEBUG_K8S_API:
+        # Log the full object details in pretty format
+        try:
+            # Convert to dict if it's a Kubernetes object
+            if hasattr(full_object, 'to_dict'):
+                obj_dict = full_object.to_dict()
+            else:
+                obj_dict = full_object
+            
+            logger.debug(f"Full {obj_type} object data: {json.dumps(obj_dict, indent=2, default=str)}")
+        except Exception as e:
+            logger.debug(f"Could not serialize {obj_type} object: {e}")
+
 def are_watchers_initialized():
     """Check if all watch threads have been initialized."""
     return all(watch_initialized.values())
@@ -240,11 +279,18 @@ def watch_nodes():
     client.configuration.verify_ssl = False
     v1 = client.CoreV1Api()
     w = watch.Watch()
+    
+    logger.info("Starting node watcher...")
+    
     for event in w.stream(v1.list_node, timeout_seconds=0):
         node = event['object']
+        event_type = event['type']
         node_name = node.metadata.name
         provider_id = node.spec.provider_id
         annotations = node.metadata.annotations or {}
+        
+        # Log API response in debug mode
+        log_k8s_api_response("WATCH", "Node", node_name, event_type, node if DEBUG_K8S_API else None)
         
         # Extract EC2 instance ID from provider ID
         ec2_instance_id = None
@@ -259,6 +305,9 @@ def watch_nodes():
             "cluster_name": cluster_name
         }
         
+        if DEBUG_K8S_API:
+            logger.debug(f"Node cache updated for {node_name}: {node_cache[node_name]}")
+        
         # Mark nodes watcher as initialized after first event
         if not watch_initialized["nodes"]:
             watch_initialized["nodes"] = True
@@ -270,9 +319,17 @@ def watch_pods():
     client.configuration.verify_ssl = False
     v1 = client.CoreV1Api()
     w = watch.Watch()
+    
+    logger.info("Starting pod watcher...")
+    
     for event in w.stream(v1.list_pod_for_all_namespaces, timeout_seconds=0):
         pod = event['object']
+        event_type = event['type']
         uid = pod.metadata.uid
+        pod_name = f"{pod.metadata.namespace}/{pod.metadata.name}"
+
+        # Log API response in debug mode
+        log_k8s_api_response("WATCH", "Pod", pod_name, event_type, pod if DEBUG_K8S_API else None)
 
         requests_cpu = requests_mem = requests_storage = 0
         limits_cpu = limits_mem = limits_storage = 0
@@ -302,7 +359,8 @@ def watch_pods():
                     pvc_info.append({
                         "pvc_name": claim_name,
                         "storage_request_bytes": pvc["storage_request_bytes"],
-                        "aws_volume_id": pvc["volume_handle"]
+                        "volume_name": pvc["volume_name"],
+                        "aws_volume_id": pv["aws_volume_id"] if pv else None
                     })
 
         pod_cache[uid] = {
@@ -324,6 +382,9 @@ def watch_pods():
             "pvcs": pvc_info
         }
         
+        if DEBUG_K8S_API:
+            logger.debug(f"Pod cache updated for {pod_name}: {json.dumps(pod_cache[uid], indent=2, default=str)}")
+        
         # Mark pods watcher as initialized after first event
         if not watch_initialized["pods"]:
             watch_initialized["pods"] = True
@@ -333,21 +394,35 @@ def watch_pvcs():
     config.load_incluster_config()
     # Disable SSL verification for Kubernetes API
     client.configuration.verify_ssl = False
+    
+    logger.info("Starting PVC watcher...")
+    
+    # Mark PVCs watcher as initialized immediately
     if not watch_initialized["pvcs"]:
         watch_initialized["pvcs"] = True
         logger.info("PVC watcher initialized")
 
     v1 = client.CoreV1Api()
     w = watch.Watch()
+    
     for event in w.stream(v1.list_persistent_volume_claim_for_all_namespaces, timeout_seconds=0):
         pvc = event['object']
+        event_type = event['type']
+        pvc_name = f"{pvc.metadata.namespace}/{pvc.metadata.name}"
+        
+        # Log API response in debug mode
+        log_k8s_api_response("WATCH", "PVC", pvc_name, event_type, pvc if DEBUG_K8S_API else None)
+        
         pvc_cache[pvc.metadata.uid] = {
             "namespace": pvc.metadata.namespace,
             "name": pvc.metadata.name,
             "storage_request_bytes": parse_quantity(pvc.spec.resources.requests.get("storage", "0")),
-            "volume_name": pvc.spec.volume_name,
-            "volume_handle": pvc.spec.volume_handle
+            "volume_name": pvc.spec.volume_name
+          
         }
+        
+        if DEBUG_K8S_API:
+            logger.debug(f"PVC cache updated for {pvc_name}: {pvc_cache[pvc.metadata.uid]}")
         
         # Mark PVCs watcher as initialized after first event
    
@@ -356,21 +431,36 @@ def watch_pvs():
     config.load_incluster_config()
     # Disable SSL verification for Kubernetes API
     client.configuration.verify_ssl = False
-            # Mark PVs watcher as initialized after first event
+    
+    logger.info("Starting PV watcher...")
+    
+    # Mark PVs watcher as initialized immediately
     if not watch_initialized["pvs"]:
         watch_initialized["pvs"] = True
         logger.info("PV watcher initialized")
+        
     v1 = client.CoreV1Api()
     w = watch.Watch()
+    
     for event in w.stream(v1.list_persistent_volume, timeout_seconds=0):
         pv = event['object']
+        event_type = event['type']
+        pv_name = pv.metadata.name
+        
+        # Log API response in debug mode
+        log_k8s_api_response("WATCH", "PV", pv_name, event_type, pv if DEBUG_K8S_API else None)
+        
         vol_id = None
-        if pv.spec.aws_elastic_block_store:
-            vol_id = pv.spec.aws_elastic_block_store.volume_id
+        if pv.spec.volume_handle:
+            vol_id = pv.spec.volume_handle
+            
         pv_cache[pv.metadata.name] = {
             "aws_volume_id": vol_id,
             "storage_class": pv.spec.storage_class_name
         }
+        
+        if DEBUG_K8S_API:
+            logger.debug(f"PV cache updated for {pv_name}: {pv_cache[pv.metadata.name]}")
         
 
 
@@ -462,6 +552,7 @@ def create_app():
         """Health check endpoint that includes watcher initialization status."""
         return jsonify({
             "status": "healthy",
+            "debug_k8s_api": DEBUG_K8S_API,
             "watchers_initialized": watch_initialized,
             "all_watchers_ready": are_watchers_initialized()
         }), 200

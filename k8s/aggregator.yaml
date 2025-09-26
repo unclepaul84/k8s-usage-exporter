@@ -46,6 +46,8 @@ spec:
           value: "us-east-1"
         - name: AWS_ENDPOINT_URL
           value: "http://localhost:9000"  # MinIO endpoint from iceberg config
+        - name: DEBUG_K8S_API
+          value: "false"  # Set to "true" to enable detailed K8s API logging
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
