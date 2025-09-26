@@ -360,7 +360,8 @@ def watch_pods():
                         "pvc_name": claim_name,
                         "storage_request_bytes": pvc["storage_request_bytes"],
                         "volume_name": pvc["volume_name"],
-                        "aws_volume_id": pv["aws_volume_id"] if pv else None
+                        "aws_volume_id": pv["aws_volume_id"] if pv else None,
+                        "storage_class": pv["storage_class"] if pv else None
                     })
 
         pod_cache[uid] = {
@@ -451,12 +452,12 @@ def watch_pvs():
         log_k8s_api_response("WATCH", "PV", pv_name, event_type, pv if DEBUG_K8S_API else None)
         
         vol_id = None
-        if pv.spec.volume_handle:
-            vol_id = pv.spec.volume_handle
-            
+        if pv.csi and pv.csi.volume_handle:
+            vol_id = pv.csi.spec.volume_handle
+
         pv_cache[pv.metadata.name] = {
             "aws_volume_id": vol_id,
-            "storage_class": pv.spec.storage_class_name
+            "storage_class": pv.spec.storage_class_name if pv.spec else None
         }
         
         if DEBUG_K8S_API:
