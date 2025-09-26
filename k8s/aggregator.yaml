@@ -36,7 +36,7 @@ spec:
         ports:
         - containerPort: 8888
         env:
-        - name: CLUSTER_ID
+        - name: CLUSTER_NAME
           value: "sample-cluster-01"
         - name: S3_BUCKET
           value: "warehouse"  # MinIO bucket from iceberg config

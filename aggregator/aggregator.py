@@ -197,7 +197,7 @@ def upload_to_s3(parquet_data, cluster_id, node_name):
         )
         
         # Create the full S3 key
-        s3_key = f"{formatted_prefix}cluster_id={cluster_id}/year={datetime.utcnow().strftime('%Y')}/month={datetime.utcnow().strftime('%m')}/day={datetime.utcnow().strftime('%d')}/metrics_{cluster_id}_{node_name}_{current_timestamp}.parquet"
+        s3_key = f"{formatted_prefix}cluster-name={cluster_id}/year={datetime.utcnow().strftime('%Y')}/month={datetime.utcnow().strftime('%m')}/day={datetime.utcnow().strftime('%d')}/metrics_{cluster_id}_{node_name}_{current_timestamp}.parquet"
         
         # Upload to S3
         s3_client.put_object(
