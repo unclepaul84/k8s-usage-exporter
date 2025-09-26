@@ -128,10 +128,11 @@ def convert_to_parquet(payload):
                 "cluster_id": payload["cluster_id"],
                 "node_name": payload["node_name"],
                 "ec2_instance_id": payload["ec2_instance_id"],
+                "pod_name": pod.get("pod_name"),
                 "pod_id": pod.get("pod_id"),
                 "namespace": pod.get("namespace"),
                 "owner": pod.get("owner"),
-                "node": pod.get("node"),
+                "node": pod.get("node"),          
                 "cpu_usage_cores": pod.get("cpu_usage_cores"),
                 "memory_usage_bytes": pod.get("memory_usage_bytes"),
                 "net_tx_bytes": pod.get("net_tx_bytes", 0),
@@ -370,6 +371,7 @@ def watch_pods():
             "annotations": pod.metadata.annotations or {},
             "owner": pod.metadata.owner_references[0].name if pod.metadata.owner_references else None,
             "node": pod.spec.node_name,
+            "pod_name": pod.metadata.name,
             "requests": {
                 "cpu_millicores": requests_cpu,
                 "memory_bytes": requests_mem,
@@ -452,14 +454,14 @@ def watch_pvs():
         log_k8s_api_response("WATCH", "PV", pv_name, event_type, pv if DEBUG_K8S_API else None)
         
         vol_id = None
-        if pv.csi and pv.csi.volume_handle:
-            vol_id = pv.csi.spec.volume_handle
+        if pv.spec.csi and pv.spec.csi.volume_handle:
+            vol_id = pv.spec.csi.volume_handle
 
         pv_cache[pv.metadata.name] = {
             "aws_volume_id": vol_id,
             "storage_class": pv.spec.storage_class_name if pv.spec else None
         }
-        
+        # Mark PVs watcher as initialized after first event
         if DEBUG_K8S_API:
             logger.debug(f"PV cache updated for {pv_name}: {pv_cache[pv.metadata.name]}")
         
@@ -519,6 +521,35 @@ def create_app():
         for pod in payload.get("pods", []):
             uid = pod["pod_id"]
             meta = pod_cache.get(uid, {})
+            
+            # Refresh PVC info from current caches using existing PVC names from pod cache
+            if meta and "pvcs" in meta:
+                refreshed_pvc_info = []
+                for existing_pvc in meta["pvcs"]:
+                    pvc_name = existing_pvc.get("pvc_name")
+                    namespace = meta.get("namespace")
+                    
+                    if pvc_name and namespace:
+                        # Direct lookup by namespace and name instead of iterating
+                        pvc_data = next((v for k, v in pvc_cache.items() 
+                                       if v["namespace"] == namespace and v["name"] == pvc_name), None)
+                        
+                        if pvc_data:
+                            pv_data = pv_cache.get(pvc_data.get("volume_name"), {})
+                            refreshed_pvc_info.append({
+                                "pvc_name": pvc_name,
+                                "storage_request_bytes": pvc_data["storage_request_bytes"],
+                                "volume_name": pvc_data.get("volume_name"),
+                                "aws_volume_id": pv_data.get("aws_volume_id"),
+                                "storage_class": pv_data.get("storage_class")
+                            })
+                        else:
+                            # Keep existing data if PVC not found in cache
+                            refreshed_pvc_info.append(existing_pvc)
+                
+                # Update meta with refreshed PVC info
+                meta = {**meta, "pvcs": refreshed_pvc_info}
+            
             enriched_pods.append({
                 **pod,
                 **meta,
