@@ -17,6 +17,8 @@ MAX_CONSECUTIVE_FAILURES = int(os.getenv("MAX_CONSECUTIVE_FAILURES", "5"))  # Ex
 KUBELET_ENDPOINT = os.getenv("KUBELET_ENDPOINT", "https://127.0.0.1:10250/stats/summary")
 ENABLE_EC2_INSTANCE_ID = os.getenv("ENABLE_EC2_INSTANCE_ID", "true").lower() == "true"
 EC2_METADATA_ENDPOINT = "http://169.254.169.254/latest/meta-data/instance-id"
+EC2_METADATA_TOKEN_TTL = os.getenv("EC2_METADATA_TOKEN_TTL", "21600")  # 6 hours default
+FORCE_IMDSV1 = os.getenv("FORCE_IMDSV1", "false").lower() == "true"  # Force IMDSv1 only
 
 # Kubernetes mounts these into every pod
 TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
@@ -37,24 +39,77 @@ def get_token():
 
 def get_ec2_instance_id():
     """
-    Fetch EC2 instance ID from AWS metadata endpoint.
+    Fetch EC2 instance ID from AWS metadata endpoint using IMDSv2.
+    Uses token-based authentication for improved security.
+    Falls back to IMDSv1 if IMDSv2 fails, unless FORCE_IMDSV1 is enabled.
     Returns None if the endpoint is not available or times out.
     """
     if not ENABLE_EC2_INSTANCE_ID:
         return None
-        
+    
+    # If forced to use IMDSv1 only, skip IMDSv2
+    if FORCE_IMDSV1:
+        print("FORCE_IMDSV1 enabled, using IMDSv1 only")
+        try:
+            resp = requests.get(
+                EC2_METADATA_ENDPOINT,
+                timeout=2
+            )
+            resp.raise_for_status()
+            instance_id = resp.text.strip()
+            print(f"Retrieved EC2 instance ID (IMDSv1): {instance_id}")
+            return instance_id
+        except Exception as e:
+            print(f"Failed to retrieve EC2 instance ID (IMDSv1): {e}")
+            return None
+    
+    # First try IMDSv2 (token-based)
     try:
+        # Step 1: Get session token for IMDSv2
+        token_url = "http://169.254.169.254/latest/api/token"
+        token_headers = {
+            "X-aws-ec2-metadata-token-ttl-seconds": EC2_METADATA_TOKEN_TTL
+        }
+        
+        token_resp = requests.put(
+            token_url,
+            headers=token_headers,
+            timeout=2
+        )
+        token_resp.raise_for_status()
+        session_token = token_resp.text.strip()
+        
+        # Step 2: Use session token to get instance ID
+        metadata_headers = {
+            "X-aws-ec2-metadata-token": session_token
+        }
+        
         resp = requests.get(
             EC2_METADATA_ENDPOINT,
-            timeout=2  # Short timeout since this is a local endpoint
+            headers=metadata_headers,
+            timeout=2
         )
         resp.raise_for_status()
         instance_id = resp.text.strip()
-        print(f"Retrieved EC2 instance ID: {instance_id}")
+        print(f"Retrieved EC2 instance ID (IMDSv2): {instance_id}")
         return instance_id
+        
     except Exception as e:
-        print(f"Failed to retrieve EC2 instance ID: {e}")
-        return None
+        print(f"IMDSv2 failed: {e}, falling back to IMDSv1")
+        
+        # Fallback to IMDSv1 for backward compatibility
+        try:
+            resp = requests.get(
+                EC2_METADATA_ENDPOINT,
+                timeout=2
+            )
+            resp.raise_for_status()
+            instance_id = resp.text.strip()
+            print(f"Retrieved EC2 instance ID (IMDSv1 fallback): {instance_id}")
+            return instance_id
+        except Exception as fallback_e:
+            print(f"Failed to retrieve EC2 instance ID (both IMDSv2 and IMDSv1): {fallback_e}")
+            return None
 
 def fetch_kubelet_summary(token):
     headers = {"Authorization": f"Bearer {token}"}
@@ -139,6 +194,9 @@ def main():
     print(f"Starting collector with initial delay of {initial_delay:.2f} seconds")
     print(f"Will exit after {MAX_CONSECUTIVE_FAILURES} consecutive failures")
     print(f"EC2 instance ID collection: {'enabled' if ENABLE_EC2_INSTANCE_ID else 'disabled'}")
+    if ENABLE_EC2_INSTANCE_ID:
+        print(f"EC2 metadata mode: {'IMDSv1 only' if FORCE_IMDSV1 else 'IMDSv2 with IMDSv1 fallback'}")
+        print(f"EC2 metadata token TTL: {EC2_METADATA_TOKEN_TTL} seconds")
     time.sleep(initial_delay)
     
     token = get_token()

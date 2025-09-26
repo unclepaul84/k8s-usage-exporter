@@ -207,6 +207,14 @@ node_cache = {}   # node_name → {ec2_instance_id, cluster_name}
 pvc_cache = {}    # pvc_uid → {namespace, name, storage_request_bytes, volume_name}
 pv_cache = {}     # pv_name → {aws_volume_id, storage_class}
 
+# Initialization flags for watch threads
+watch_initialized = {
+    "nodes": False,
+    "pods": False,
+    "pvcs": False,
+    "pvs": False
+}
+
 def parse_quantity(qty: str) -> int:
     """Convert K8s quantity string to int (bytes or millicores)."""
     if not qty:
@@ -221,6 +229,10 @@ def parse_quantity(qty: str) -> int:
     if q.endswith("gi"):
         return int(q[:-2]) * 1024 * 1024 * 1024
     return int(q)
+
+def are_watchers_initialized():
+    """Check if all watch threads have been initialized."""
+    return all(watch_initialized.values())
 
 def watch_nodes():
     config.load_incluster_config()
@@ -246,6 +258,11 @@ def watch_nodes():
             "ec2_instance_id": ec2_instance_id,
             "cluster_name": cluster_name
         }
+        
+        # Mark nodes watcher as initialized after first event
+        if not watch_initialized["nodes"]:
+            watch_initialized["nodes"] = True
+            logger.info("Node watcher initialized")
 
 def watch_pods():
     config.load_incluster_config()
@@ -285,7 +302,7 @@ def watch_pods():
                     pvc_info.append({
                         "pvc_name": claim_name,
                         "storage_request_bytes": pvc["storage_request_bytes"],
-                        "aws_volume_id": pv.get("aws_volume_id")
+                        "aws_volume_id": pvc["volume_handle"]
                     })
 
         pod_cache[uid] = {
@@ -306,11 +323,20 @@ def watch_pods():
             },
             "pvcs": pvc_info
         }
+        
+        # Mark pods watcher as initialized after first event
+        if not watch_initialized["pods"]:
+            watch_initialized["pods"] = True
+            logger.info("Pod watcher initialized")
 
 def watch_pvcs():
     config.load_incluster_config()
     # Disable SSL verification for Kubernetes API
     client.configuration.verify_ssl = False
+    if not watch_initialized["pvcs"]:
+        watch_initialized["pvcs"] = True
+        logger.info("PVC watcher initialized")
+
     v1 = client.CoreV1Api()
     w = watch.Watch()
     for event in w.stream(v1.list_persistent_volume_claim_for_all_namespaces, timeout_seconds=0):
@@ -319,13 +345,21 @@ def watch_pvcs():
             "namespace": pvc.metadata.namespace,
             "name": pvc.metadata.name,
             "storage_request_bytes": parse_quantity(pvc.spec.resources.requests.get("storage", "0")),
-            "volume_name": pvc.spec.volume_name
+            "volume_name": pvc.spec.volume_name,
+            "volume_handle": pvc.spec.volume_handle
         }
+        
+        # Mark PVCs watcher as initialized after first event
+   
 
 def watch_pvs():
     config.load_incluster_config()
     # Disable SSL verification for Kubernetes API
     client.configuration.verify_ssl = False
+            # Mark PVs watcher as initialized after first event
+    if not watch_initialized["pvs"]:
+        watch_initialized["pvs"] = True
+        logger.info("PV watcher initialized")
     v1 = client.CoreV1Api()
     w = watch.Watch()
     for event in w.stream(v1.list_persistent_volume, timeout_seconds=0):
@@ -337,6 +371,8 @@ def watch_pvs():
             "aws_volume_id": vol_id,
             "storage_class": pv.spec.storage_class_name
         }
+        
+
 
 def start_background_watchers():
     """Start all Kubernetes watchers as background threads."""
@@ -370,6 +406,11 @@ def create_app():
         else:
             logger.debug("Payload schema validation passed")
         
+        # Check if watch threads have been initialized
+        if not are_watchers_initialized():
+            logger.warning(f"Watch threads not fully initialized yet. Skipping S3 upload. Status: {watch_initialized}")
+            return jsonify({"status": "accepted", "message": "watchers not initialized, data not persisted"}), 202
+        
         node_name = payload.get("node_name")
         
         # Get node information from cache
@@ -379,7 +420,7 @@ def create_app():
         ec2_instance_id = payload.get("ec2_instance_id") or node_info.get("ec2_instance_id")
         
         # Use cluster name from node annotation, fallback to environment variable
-        cluster_id = node_info.get("cluster_name") or os.getenv("CLUSTER_ID", "unknown")
+        cluster_id = node_info.get("cluster_name") or os.getenv("CLUSTER_NAME", "unknown")
 
         enriched_pods = []
         for pod in payload.get("pods", []):
@@ -413,6 +454,16 @@ def create_app():
         # Also log for debugging
         logger.debug(f"Processed metrics payload: {enriched_payload}")
         return jsonify({"status": "ok"}), 200
+
+    @app.route("/health", methods=["GET"])
+    def health_check():
+        """Health check endpoint that includes watcher initialization status."""
+        return jsonify({
+            "status": "healthy",
+            "watchers_initialized": watch_initialized,
+            "all_watchers_ready": are_watchers_initialized()
+        }), 200
+    
     return app
 
 # WSGI application entry point

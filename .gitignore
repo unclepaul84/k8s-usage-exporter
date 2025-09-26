@@ -214,3 +214,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+k8s/aggregator_aws.yaml
+k8s/collector.daemonset_aws.yaml
+k8s/kubctl-aws-config.yaml
