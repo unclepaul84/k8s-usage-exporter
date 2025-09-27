@@ -240,6 +240,7 @@ def parse_summary(summary, ec2_instance_id=None):
         name = pod["podRef"]["name"]
 
         cpu_nano = int(pod.get("cpu", {}).get("usageNanoCores", 0))
+        cpu_cum_nano = int(pod.get("cpu", {}).get("usageCoreNanoSeconds", 0))
         mem_bytes = int(pod.get("memory", {}).get("usageBytes", 0))
         net_tx = int(pod.get("network", {}).get("txBytes", 0))
         net_rx = int(pod.get("network", {}).get("rxBytes", 0))
@@ -262,12 +263,15 @@ def parse_summary(summary, ec2_instance_id=None):
             "namespace": namespace,
             "name": name,
             "cpu_usage_cores": cpu_nano / 1e9,
+            "cpu_usage_cum": cpu_cum_nano / 1e9,
             "memory_usage_bytes": mem_bytes,
             "net_tx_bytes": net_tx,
             "net_rx_bytes": net_rx,
             "pod_start_time": earliest_start_time.isoformat() if earliest_start_time else None
         })
 
+    # Get node-level metrics removed - keeping only pod-level metrics
+    
     payload = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "node_name": node_name,

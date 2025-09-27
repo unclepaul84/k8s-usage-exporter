@@ -61,6 +61,14 @@
             "minimum": 0,
             "description": "CPU usage in cores (decimal)"
           },
+          "cpu_usage_cum": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Cumulative CPU usage for the pod in nanoseconds"
+          },
           "memory_usage_bytes": {
             "type": [
               "integer",

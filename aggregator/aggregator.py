@@ -134,6 +134,7 @@ def convert_to_parquet(payload):
                 "owner": pod.get("owner"),
                 "node": pod.get("node"),          
                 "cpu_usage_cores": pod.get("cpu_usage_cores"),
+                "cpu_usage_cum_sec": pod.get("cpu_usage_cum", 0),
                 "memory_usage_bytes": pod.get("memory_usage_bytes"),
                 "net_tx_bytes": pod.get("net_tx_bytes", 0),
                 "net_rx_bytes": pod.get("net_rx_bytes", 0),
