@@ -63,7 +63,7 @@
           },
           "cpu_usage_cum": {
             "type": [
-              "integer",
+              "number",
               "null"
             ],
             "minimum": 0,
@@ -71,7 +71,7 @@
           },
           "memory_usage_bytes": {
             "type": [
-              "integer",
+              "number",
               "null"
             ],
             "minimum": 0,
@@ -79,7 +79,7 @@
           },
           "net_tx_bytes": {
             "type": [
-              "integer",
+              "number",
               "null"
             ],
             "minimum": 0,
@@ -87,7 +87,7 @@
           },
           "net_rx_bytes": {
             "type": [
-              "integer",
+              "number",
               "null"
             ],
             "minimum": 0,

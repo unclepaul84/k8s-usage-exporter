@@ -11,6 +11,7 @@ from datetime import datetime
 from io import BytesIO
 from botocore.exceptions import ClientError
 from jsonschema import validate, ValidationError
+import time
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -86,7 +87,6 @@ def initialize_s3_client():
         # Configure S3 client with optional custom endpoint
     s3_config = {
         'region_name': AWS_REGION,
-        'config': boto3.session.Config(signature_version='s3v4'),
         'verify': False  # Disable SSL verification for custom endpoints
     }
     
@@ -97,7 +97,7 @@ def initialize_s3_client():
     s3_client = boto3.client('s3', **s3_config)
     
     # Test S3 connection
-    #s3_client.head_bucket(Bucket=S3_BUCKET)
+    s3_client.head_bucket(Bucket=S3_BUCKET)
     
     endpoint_info = f" with endpoint {AWS_ENDPOINT_URL}" if AWS_ENDPOINT_URL else ""
     logger.info(f"S3 client initialized successfully for bucket: {S3_BUCKET}{endpoint_info}")
@@ -482,7 +482,13 @@ def create_app():
     
     # Start background watchers when app is created
     start_background_watchers()
-
+    
+    while not are_watchers_initialized():
+        logger.info(f"Watchers status: {watch_initialized}")
+        time.sleep(2)  # Wait 2 seconds before checking again
+        
+        logger.info("All watchers initialized successfully!")
+        
     """Create and configure the Flask app."""
     app = Flask(__name__)
     
@@ -591,6 +597,9 @@ def create_app():
         }), 200
     
     return app
+
+
+
 
 # WSGI application entry point
 app = create_app()
