@@ -1,0 +1,72 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cpu-burner-sample
+  namespace: default
+  labels:
+    app: cpu-burner-sample
+    component: test-workload
+    version: v1.0.0
+  annotations:
+    deployment.kubernetes.io/revision: "1"
+    description: "Sample CPU-intensive workload for testing k8s-usage-exporter"
+    owner: "platform-team"
+    environment: "test"
+    cost-center: "engineering"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cpu-burner-sample
+  template:
+    metadata:
+      labels:
+        app: cpu-burner-sample
+        component: test-workload
+        version: v1.0.0
+        tier: compute-intensive
+      annotations:
+        pod.kubernetes.io/description: "CPU burner pod for metrics testing"
+        monitoring.example.com/scrape: "true"
+        monitoring.example.com/port: "8080"
+        app.code: "55555555555"
+        cost-allocation.example.com/team: "platform"
+        cost-allocation.example.com/project: "metrics-testing"
+        performance.example.com/expected-cpu: "1.0"
+        performance.example.com/requested-cpu: "0.5"
+    spec:
+      containers:
+      - name: cpu-burner
+        image: busybox:1.35
+        command: 
+        - /bin/sh
+        - -c
+        - |
+          echo "Starting CPU burner - will consume ~1 CPU core"
+          echo "Requested: 0.5 CPU, Expected usage: ~1.0 CPU"
+          echo "Pod: $HOSTNAME, Namespace: $POD_NAMESPACE"
+          # Infinite loop to burn CPU - uses 'yes' command piped to /dev/null
+          # This will max out approximately 1 CPU core
+          yes > /dev/null
+        env:
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        resources:
+          requests:
+            cpu: "100m"      # Request 0.5 CPU
+            memory: "64Mi"   # Minimal memory needed
+          limits:
+            cpu: "1200m"     # Allow up to 1.2 CPU (20% buffer)
+            memory: "128Mi"  # Memory limit
+
+

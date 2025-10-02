@@ -168,9 +168,9 @@ def convert_to_parquet(payload):
         # Convert to DataFrame
         df = pd.DataFrame(records)
         
-        # Convert to parquet bytes
+        # Convert to parquet bytes with Snappy compression
         parquet_buffer = BytesIO()
-        df.to_parquet(parquet_buffer, index=False, engine='pyarrow')
+        df.to_parquet(parquet_buffer, index=False, engine='pyarrow', compression='snappy')
         parquet_buffer.seek(0)
         
         return parquet_buffer.getvalue()
@@ -275,103 +275,62 @@ def are_watchers_initialized():
     """Check if all watch threads have been initialized."""
     return all(watch_initialized.values())
 
-def watch_nodes():
-    config.load_incluster_config()
-    # Disable SSL verification for Kubernetes API
-    client.configuration.verify_ssl = False
-    v1 = client.CoreV1Api()
-    w = watch.Watch()
+def update_pod_cache(pod, operation="UNKNOWN"):
+    """
+    Update the pod cache with pod metadata and resource information.
     
-    logger.info("Starting node watcher...")
-    
-    for event in w.stream(v1.list_node, timeout_seconds=0):
-        node = event['object']
-        event_type = event['type']
-        node_name = node.metadata.name
-        provider_id = node.spec.provider_id
-        annotations = node.metadata.annotations or {}
-        
-        # Log API response in debug mode
-        log_k8s_api_response("WATCH", "Node", node_name, event_type, node if DEBUG_K8S_API else None)
-        
-        # Extract EC2 instance ID from provider ID
-        ec2_instance_id = None
-        if provider_id and provider_id.startswith("aws:///"):
-            ec2_instance_id = provider_id.split("/")[-1]
-            
-        # Extract cluster name from annotation
-        cluster_name = annotations.get("cluster.x-k8s.io/cluster-name")
-        
-        node_cache[node_name] = {
-            "ec2_instance_id": ec2_instance_id,
-            "cluster_name": cluster_name
-        }
-        
-        if DEBUG_K8S_API:
-            logger.debug(f"Node cache updated for {node_name}: {node_cache[node_name]}")
-        
-        # Mark nodes watcher as initialized after first event
-        if not watch_initialized["nodes"]:
-            watch_initialized["nodes"] = True
-            logger.info("Node watcher initialized")
-
-def watch_pods():
-    config.load_incluster_config()
-    # Disable SSL verification for Kubernetes API
-    client.configuration.verify_ssl = False
-    v1 = client.CoreV1Api()
-    w = watch.Watch()
-    
-    logger.info("Starting pod watcher...")
-    
-    for event in w.stream(v1.list_pod_for_all_namespaces, timeout_seconds=0):
-        pod = event['object']
-        event_type = event['type']
+    Args:
+        pod: Kubernetes pod object
+        operation: String describing the operation (LIST, WATCH, etc.) for logging
+    """
+    try:
         uid = pod.metadata.uid
         pod_name = f"{pod.metadata.namespace}/{pod.metadata.name}"
 
         # Log API response in debug mode
-        log_k8s_api_response("WATCH", "Pod", pod_name, event_type, pod if DEBUG_K8S_API else None)
+        log_k8s_api_response(operation, "Pod", pod_name, "CACHE_UPDATE", pod if DEBUG_K8S_API else None)
 
         requests_cpu = requests_mem = requests_storage = 0
         limits_cpu = limits_mem = limits_storage = 0
 
-        for c in pod.spec.containers:
-            req = c.resources.requests or {}
-            lim = c.resources.limits or {}
-            # Requests
-            requests_cpu += parse_quantity(req.get("cpu", "0")) if "cpu" in req and req["cpu"].endswith("m") else parse_quantity(req.get("cpu", "0"))*1000
-            requests_mem += parse_quantity(req.get("memory", "0"))
-            requests_storage += parse_quantity(req.get("ephemeral-storage", "0"))
-            # Limits
-            limits_cpu += parse_quantity(lim.get("cpu", "0")) if "cpu" in lim and lim["cpu"].endswith("m") else parse_quantity(lim.get("cpu", "0"))*1000
-            limits_mem += parse_quantity(lim.get("memory", "0"))
-            limits_storage += parse_quantity(lim.get("ephemeral-storage", "0"))
+        if pod.spec and pod.spec.containers:
+            for c in pod.spec.containers:
+                req = c.resources.requests or {} if c.resources else {}
+                lim = c.resources.limits or {} if c.resources else {}
+                # Requests
+                requests_cpu += parse_quantity(req.get("cpu", "0")) if "cpu" in req and req["cpu"].endswith("m") else parse_quantity(req.get("cpu", "0"))*1000
+                requests_mem += parse_quantity(req.get("memory", "0"))
+                requests_storage += parse_quantity(req.get("ephemeral-storage", "0"))
+                # Limits
+                limits_cpu += parse_quantity(lim.get("cpu", "0")) if "cpu" in lim and lim["cpu"].endswith("m") else parse_quantity(lim.get("cpu", "0"))*1000
+                limits_mem += parse_quantity(lim.get("memory", "0"))
+                limits_storage += parse_quantity(lim.get("ephemeral-storage", "0"))
 
         # Map PVCs mounted by pod
         pvc_info = []
-        for vol in pod.spec.volumes or []:
-            if vol.persistent_volume_claim:
-                claim_name = vol.persistent_volume_claim.claim_name
-                ns = pod.metadata.namespace
-                # Lookup PVC UID
-                pvc = next((v for v in pvc_cache.values() if v["namespace"]==ns and v["name"]==claim_name), None)
-                if pvc:
-                    pv = pv_cache.get(pvc["volume_name"], {})
-                    pvc_info.append({
-                        "pvc_name": claim_name,
-                        "storage_request_bytes": pvc["storage_request_bytes"],
-                        "volume_name": pvc["volume_name"],
-                        "aws_volume_id": pv["aws_volume_id"] if pv else None,
-                        "storage_class": pv["storage_class"] if pv else None
-                    })
+        if pod.spec and pod.spec.volumes:
+            for vol in pod.spec.volumes:
+                if vol.persistent_volume_claim:
+                    claim_name = vol.persistent_volume_claim.claim_name
+                    ns = pod.metadata.namespace
+                    # Lookup PVC UID
+                    pvc = next((v for v in pvc_cache.values() if v["namespace"]==ns and v["name"]==claim_name), None)
+                    if pvc:
+                        pv = pv_cache.get(pvc["volume_name"], {})
+                        pvc_info.append({
+                            "pvc_name": claim_name,
+                            "storage_request_bytes": pvc["storage_request_bytes"],
+                            "volume_name": pvc["volume_name"],
+                            "aws_volume_id": pv["aws_volume_id"] if pv else None,
+                            "storage_class": pv["storage_class"] if pv else None
+                        })
 
         pod_cache[uid] = {
             "namespace": pod.metadata.namespace,
             "labels": pod.metadata.labels or {},
             "annotations": pod.metadata.annotations or {},
             "owner": pod.metadata.owner_references[0].name if pod.metadata.owner_references else None,
-            "node": pod.spec.node_name,
+            "node": pod.spec.node_name if pod.spec else None,
             "pod_name": pod.metadata.name,
             "requests": {
                 "cpu_millicores": requests_cpu,
@@ -388,71 +347,94 @@ def watch_pods():
         
         if DEBUG_K8S_API:
             logger.debug(f"Pod cache updated for {pod_name}: {json.dumps(pod_cache[uid], indent=2, default=str)}")
+            
+        return True
         
-        # Mark pods watcher as initialized after first event
-        if not watch_initialized["pods"]:
-            watch_initialized["pods"] = True
-            logger.info("Pod watcher initialized")
+    except Exception as e:
+        logger.error(f"Failed to update pod cache for pod {pod.metadata.name if pod.metadata else 'unknown'}: {e}")
+        return False
 
-def watch_pvcs():
-    config.load_incluster_config()
-    # Disable SSL verification for Kubernetes API
-    client.configuration.verify_ssl = False
+def update_node_cache(node, operation="UNKNOWN"):
+    """
+    Update the node cache with node metadata and EC2 information.
     
-    logger.info("Starting PVC watcher...")
-    
-    # Mark PVCs watcher as initialized immediately
-    if not watch_initialized["pvcs"]:
-        watch_initialized["pvcs"] = True
-        logger.info("PVC watcher initialized")
+    Args:
+        node: Kubernetes node object
+        operation: String describing the operation (LIST, WATCH, etc.) for logging
+    """
+    try:
+        node_name = node.metadata.name
+        provider_id = node.spec.provider_id
+        annotations = node.metadata.annotations or {}
+        
+        # Log API response in debug mode
+        log_k8s_api_response(operation, "Node", node_name, "CACHE_UPDATE", node if DEBUG_K8S_API else None)
+        
+        # Extract EC2 instance ID from provider ID
+        ec2_instance_id = None
+        if provider_id and provider_id.startswith("aws:///"):
+            ec2_instance_id = provider_id.split("/")[-1]
+            
+        # Extract cluster name from annotation
+        cluster_name = annotations.get("cluster.x-k8s.io/cluster-name")
+        
+        node_cache[node_name] = {
+            "ec2_instance_id": ec2_instance_id,
+            "cluster_name": cluster_name
+        }
+        
+        if DEBUG_K8S_API:
+            logger.debug(f"Node cache updated for {node_name}: {node_cache[node_name]}")
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to update node cache for node {node.metadata.name if node.metadata else 'unknown'}: {e}")
+        return False
 
-    v1 = client.CoreV1Api()
-    w = watch.Watch()
+def update_pvc_cache(pvc, operation="UNKNOWN"):
+    """
+    Update the PVC cache with PVC metadata and storage information.
     
-    for event in w.stream(v1.list_persistent_volume_claim_for_all_namespaces, timeout_seconds=0):
-        pvc = event['object']
-        event_type = event['type']
+    Args:
+        pvc: Kubernetes PVC object
+        operation: String describing the operation (LIST, WATCH, etc.) for logging
+    """
+    try:
         pvc_name = f"{pvc.metadata.namespace}/{pvc.metadata.name}"
         
         # Log API response in debug mode
-        log_k8s_api_response("WATCH", "PVC", pvc_name, event_type, pvc if DEBUG_K8S_API else None)
+        log_k8s_api_response(operation, "PVC", pvc_name, "CACHE_UPDATE", pvc if DEBUG_K8S_API else None)
         
         pvc_cache[pvc.metadata.uid] = {
             "namespace": pvc.metadata.namespace,
             "name": pvc.metadata.name,
             "storage_request_bytes": parse_quantity(pvc.spec.resources.requests.get("storage", "0")),
             "volume_name": pvc.spec.volume_name
-          
         }
         
         if DEBUG_K8S_API:
             logger.debug(f"PVC cache updated for {pvc_name}: {pvc_cache[pvc.metadata.uid]}")
+            
+        return True
         
-        # Mark PVCs watcher as initialized after first event
-   
+    except Exception as e:
+        logger.error(f"Failed to update PVC cache for PVC {pvc.metadata.name if pvc.metadata else 'unknown'}: {e}")
+        return False
 
-def watch_pvs():
-    config.load_incluster_config()
-    # Disable SSL verification for Kubernetes API
-    client.configuration.verify_ssl = False
+def update_pv_cache(pv, operation="UNKNOWN"):
+    """
+    Update the PV cache with PV metadata and AWS volume information.
     
-    logger.info("Starting PV watcher...")
-    
-    # Mark PVs watcher as initialized immediately
-    if not watch_initialized["pvs"]:
-        watch_initialized["pvs"] = True
-        logger.info("PV watcher initialized")
-        
-    v1 = client.CoreV1Api()
-    w = watch.Watch()
-    
-    for event in w.stream(v1.list_persistent_volume, timeout_seconds=0):
-        pv = event['object']
-        event_type = event['type']
+    Args:
+        pv: Kubernetes PV object
+        operation: String describing the operation (LIST, WATCH, etc.) for logging
+    """
+    try:
         pv_name = pv.metadata.name
         
         # Log API response in debug mode
-        log_k8s_api_response("WATCH", "PV", pv_name, event_type, pv if DEBUG_K8S_API else None)
+        log_k8s_api_response(operation, "PV", pv_name, "CACHE_UPDATE", pv if DEBUG_K8S_API else None)
         
         vol_id = None
         if pv.spec.csi and pv.spec.csi.volume_handle:
@@ -462,9 +444,279 @@ def watch_pvs():
             "aws_volume_id": vol_id,
             "storage_class": pv.spec.storage_class_name if pv.spec else None
         }
-        # Mark PVs watcher as initialized after first event
+        
         if DEBUG_K8S_API:
             logger.debug(f"PV cache updated for {pv_name}: {pv_cache[pv.metadata.name]}")
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Failed to update PV cache for PV {pv.metadata.name if pv.metadata else 'unknown'}: {e}")
+        return False
+
+def watch_nodes():
+    config.load_incluster_config()
+    # Disable SSL verification for Kubernetes API
+    client.configuration.verify_ssl = False
+    v1 = client.CoreV1Api()
+    
+    logger.info("Starting node watcher...")
+    
+    retry_count = 0
+    max_backoff = 300  # 5 minutes maximum backoff
+    
+    while True:
+        try:
+            w = watch.Watch()
+            logger.info(f"Node watcher connecting (attempt {retry_count + 1})...")
+            
+            # First, get all existing nodes to populate the cache
+            logger.info("Loading existing nodes into cache...")
+            try:
+                nodes = v1.list_node()
+                for node in nodes.items:
+                    # Use the extracted function to update node cache
+                    update_node_cache(node, "LIST")
+                
+                logger.info(f"Loaded {len(nodes.items)} existing nodes into cache")
+                
+                # Mark nodes watcher as initialized after loading existing nodes
+                if not watch_initialized["nodes"]:
+                    watch_initialized["nodes"] = True
+                    logger.info("Node watcher initialized with existing nodes")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load existing nodes: {e}")
+            
+            # Now start watching for changes
+            logger.info("Starting to watch for node changes...")
+            for event in w.stream(v1.list_node, timeout_seconds=0):
+                # Reset retry count on successful event
+                retry_count = 0
+                
+                node = event['object']
+                event_type = event['type']
+                node_name = node.metadata.name
+                
+                # Log API response in debug mode
+                log_k8s_api_response("WATCH", "Node", node_name, event_type, node if DEBUG_K8S_API else None)
+                
+                if event_type == "DELETED":
+                    # Remove node from cache on deletion
+                    if node_name in node_cache:
+                        del node_cache[node_name]
+                        if DEBUG_K8S_API:
+                            logger.debug(f"Node removed from cache: {node_name}")
+                    continue
+                
+                # Use the extracted function to update node cache
+                update_node_cache(node, "WATCH")
+                    
+        except Exception as e:
+            retry_count += 1
+            backoff_time = min(2 ** min(retry_count, 8), max_backoff)  # Exponential backoff, capped at max_backoff
+            logger.error(f"Node watcher error (attempt {retry_count}): {e}")
+            logger.info(f"Node watcher retrying in {backoff_time} seconds...")
+            time.sleep(backoff_time)
+
+def watch_pods():
+    config.load_incluster_config()
+    # Disable SSL verification for Kubernetes API
+    client.configuration.verify_ssl = False
+    v1 = client.CoreV1Api()
+    
+    logger.info("Starting pod watcher...")
+    
+    retry_count = 0
+    max_backoff = 300  # 5 minutes maximum backoff
+    
+    while True:
+        try:
+            w = watch.Watch()
+            logger.info(f"Pod watcher connecting (attempt {retry_count + 1})...")
+            
+            # First, get all existing pods to populate the cache
+            logger.info("Loading existing pods into cache...")
+            try:
+                pods = v1.list_pod_for_all_namespaces()
+                for pod in pods.items:
+                    # Use the extracted function to update pod cache
+                    update_pod_cache(pod, "LIST")
+                
+                logger.info(f"Loaded {len(pods.items)} existing pods into cache")
+                
+                # Mark pods watcher as initialized after loading existing pods
+                if not watch_initialized["pods"]:
+                    watch_initialized["pods"] = True
+                    logger.info("Pod watcher initialized with existing pods")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load existing pods: {e}")
+            
+            # Now start watching for changes
+            logger.info("Starting to watch for pod changes...")
+            for event in w.stream(v1.list_pod_for_all_namespaces, timeout_seconds=0):
+                # Reset retry count on successful event
+                retry_count = 0
+                
+                pod = event['object']
+                event_type = event['type']
+                uid = pod.metadata.uid
+                pod_name = f"{pod.metadata.namespace}/{pod.metadata.name}"
+
+                # Log API response in debug mode
+                log_k8s_api_response("WATCH", "Pod", pod_name, event_type, pod if DEBUG_K8S_API else None)
+
+                if event_type == "DELETED":
+                    # Remove pod from cache on deletion
+                    if uid in pod_cache:
+                        del pod_cache[uid]
+                        if DEBUG_K8S_API:
+                            logger.debug(f"Pod removed from cache: {pod_name}")
+                    continue
+
+                # Use the extracted function to update pod cache
+                update_pod_cache(pod, "WATCH")
+                    
+        except Exception as e:
+            retry_count += 1
+            backoff_time = min(2 ** min(retry_count, 8), max_backoff)  # Exponential backoff, capped at max_backoff
+            logger.error(f"Pod watcher error (attempt {retry_count}): {e}")
+            logger.info(f"Pod watcher retrying in {backoff_time} seconds...")
+            time.sleep(backoff_time)
+
+def watch_pvcs():
+    config.load_incluster_config()
+    # Disable SSL verification for Kubernetes API
+    client.configuration.verify_ssl = False
+    
+    logger.info("Starting PVC watcher...")
+
+    v1 = client.CoreV1Api()
+    
+    retry_count = 0
+    max_backoff = 300  # 5 minutes maximum backoff
+    
+    while True:
+        try:
+            w = watch.Watch()
+            logger.info(f"PVC watcher connecting (attempt {retry_count + 1})...")
+            
+            # First, get all existing PVCs to populate the cache
+            logger.info("Loading existing PVCs into cache...")
+            try:
+                pvcs = v1.list_persistent_volume_claim_for_all_namespaces()
+                for pvc in pvcs.items:
+                    # Use the extracted function to update PVC cache
+                    update_pvc_cache(pvc, "LIST")
+                
+                logger.info(f"Loaded {len(pvcs.items)} existing PVCs into cache")
+                
+                # Mark PVCs watcher as initialized after loading existing PVCs
+                if not watch_initialized["pvcs"]:
+                    watch_initialized["pvcs"] = True
+                    logger.info("PVC watcher initialized with existing PVCs")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load existing PVCs: {e}")
+            
+            # Now start watching for changes
+            logger.info("Starting to watch for PVC changes...")
+            for event in w.stream(v1.list_persistent_volume_claim_for_all_namespaces, timeout_seconds=0):
+                # Reset retry count on successful event
+                retry_count = 0
+                
+                pvc = event['object']
+                event_type = event['type']
+                pvc_name = f"{pvc.metadata.namespace}/{pvc.metadata.name}"
+                
+                # Log API response in debug mode
+                log_k8s_api_response("WATCH", "PVC", pvc_name, event_type, pvc if DEBUG_K8S_API else None)
+                
+                if event_type == "DELETED":
+                    # Remove PVC from cache on deletion
+                    if pvc.metadata.uid in pvc_cache:
+                        del pvc_cache[pvc.metadata.uid]
+                        if DEBUG_K8S_API:
+                            logger.debug(f"PVC removed from cache: {pvc_name}")
+                    continue
+                
+                # Use the extracted function to update PVC cache
+                update_pvc_cache(pvc, "WATCH")
+                    
+        except Exception as e:
+            retry_count += 1
+            backoff_time = min(2 ** min(retry_count, 8), max_backoff)  # Exponential backoff, capped at max_backoff
+            logger.error(f"PVC watcher error (attempt {retry_count}): {e}")
+            logger.info(f"PVC watcher retrying in {backoff_time} seconds...")
+            time.sleep(backoff_time)
+   
+
+def watch_pvs():
+    config.load_incluster_config()
+    # Disable SSL verification for Kubernetes API
+    client.configuration.verify_ssl = False
+    
+    logger.info("Starting PV watcher...")
+        
+    v1 = client.CoreV1Api()
+    
+    retry_count = 0
+    max_backoff = 300  # 5 minutes maximum backoff
+    
+    while True:
+        try:
+            w = watch.Watch()
+            logger.info(f"PV watcher connecting (attempt {retry_count + 1})...")
+            
+            # First, get all existing PVs to populate the cache
+            logger.info("Loading existing PVs into cache...")
+            try:
+                pvs = v1.list_persistent_volume()
+                for pv in pvs.items:
+                    # Use the extracted function to update PV cache
+                    update_pv_cache(pv, "LIST")
+                
+                logger.info(f"Loaded {len(pvs.items)} existing PVs into cache")
+                
+                # Mark PVs watcher as initialized after loading existing PVs
+                if not watch_initialized["pvs"]:
+                    watch_initialized["pvs"] = True
+                    logger.info("PV watcher initialized with existing PVs")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load existing PVs: {e}")
+            
+            # Now start watching for changes
+            logger.info("Starting to watch for PV changes...")
+            for event in w.stream(v1.list_persistent_volume, timeout_seconds=0):
+                # Reset retry count on successful event
+                retry_count = 0
+                
+                pv = event['object']
+                event_type = event['type']
+                pv_name = pv.metadata.name
+                
+                # Log API response in debug mode
+                log_k8s_api_response("WATCH", "PV", pv_name, event_type, pv if DEBUG_K8S_API else None)
+                
+                if event_type == "DELETED":
+                    # Remove PV from cache on deletion
+                    if pv_name in pv_cache:
+                        del pv_cache[pv_name]
+                        if DEBUG_K8S_API:
+                            logger.debug(f"PV removed from cache: {pv_name}")
+                    continue
+                
+                # Use the extracted function to update PV cache
+                update_pv_cache(pv, "WATCH")
+                    
+        except Exception as e:
+            retry_count += 1
+            backoff_time = min(2 ** min(retry_count, 8), max_backoff)  # Exponential backoff, capped at max_backoff
+            logger.error(f"PV watcher error (attempt {retry_count}): {e}")
+            logger.info(f"PV watcher retrying in {backoff_time} seconds...")
+            time.sleep(backoff_time)
         
 
 
@@ -476,25 +728,34 @@ def start_background_watchers():
     threading.Thread(target=watch_pvs, daemon=True).start()
 
 def create_app():
+    """Create and configure the Flask app."""
+    app = Flask(__name__)
+    
+    # Set production-grade Flask configuration
+    app.config['MAX_CONTENT_LENGTH'] = 10 * 1024 * 1024  # 10MB max request size
+    app.config['JSON_SORT_KEYS'] = False  # Don't sort JSON keys for better performance
     
     # Initialize S3 client
     initialize_s3_client()
     
     # Start background watchers when app is created
     start_background_watchers()
-    
+
     while not are_watchers_initialized():
         logger.info(f"Watchers status: {watch_initialized}")
         time.sleep(2)  # Wait 2 seconds before checking again
         
-        logger.info("All watchers initialized successfully!")
+    logger.info("All watchers initialized successfully!")
         
-    """Create and configure the Flask app."""
-    app = Flask(__name__)
+
     
 
     @app.route("/metrics", methods=["POST"])
     def receive_metrics():
+        if not are_watchers_initialized():
+            logger.warning(f"Watch threads not fully initialized yet. Current status: {watch_initialized}")
+            return jsonify({"status": "accepted", "message": "watchers not initialized, data not persisted"}), 202
+
         payload = request.get_json(force=True)
         
         # Validate payload schema
@@ -529,6 +790,8 @@ def create_app():
             uid = pod["pod_id"]
             meta = pod_cache.get(uid, {})
             
+            if(len(meta.keys()) == 0):
+                logger.warning(f"Pod metadata not found in cache for pod_id {uid}. Pod may be new or cache not yet populated. in the map: {pod_cache.keys()}")
             # Refresh PVC info from current caches using existing PVC names from pod cache
             if meta and "pvcs" in meta:
                 refreshed_pvc_info = []
@@ -589,12 +852,15 @@ def create_app():
     @app.route("/health", methods=["GET"])
     def health_check():
         """Health check endpoint that includes watcher initialization status."""
+        all_ready = are_watchers_initialized()
+        status_code = 200 if all_ready else 503
+        
         return jsonify({
-            "status": "healthy",
+            "status": "healthy" if all_ready else "unhealthy",
             "debug_k8s_api": DEBUG_K8S_API,
             "watchers_initialized": watch_initialized,
-            "all_watchers_ready": are_watchers_initialized()
-        }), 200
+            "all_watchers_ready": all_ready
+        }), status_code
     
     return app
 
@@ -606,7 +872,19 @@ app = create_app()
 
 if __name__ == "__main__":
     # For standalone execution (development/testing)
-    app = create_app()
-    app.run(host="0.0.0.0", port=8888)
+    try:
+        from waitress import serve
+        from server_config import WAITRESS_CONFIG
+        
+        app = create_app()
+        logger.info("Starting aggregator with Waitress server...")
+        logger.info(f"Server configuration: {WAITRESS_CONFIG}")
+        
+        serve(app, **WAITRESS_CONFIG)
+    except ImportError:
+        # Fallback to Flask dev server if waitress not available
+        logger.warning("Waitress not available, falling back to Flask development server")
+        app = create_app()
+        app.run(host="0.0.0.0", port=8888, debug=False)
 
 

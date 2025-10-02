@@ -28,3 +28,4 @@ Write-Host "Undeployment complete. Proceeding with deployment..."
 # Deploy
 kubectl apply -f k8s/collector.daemonset.yaml
 kubectl apply -f k8s/aggregator.yaml
+kubectl apply -f k8s/sample-cpu-burner.yaml

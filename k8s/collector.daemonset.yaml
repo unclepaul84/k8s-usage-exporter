@@ -28,7 +28,7 @@ spec:
         - name: KUBELET_ENDPOINT
           value: "https://127.0.0.1:10250/stats/summary"
         - name: DEBUG_K8S_API
-          value: "false"  # Set to "true" to enable detailed HTTP logging
+          value: "true"  # Set to "true" to enable detailed HTTP logging
         resources:
           requests:
             cpu: "50m"

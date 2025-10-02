@@ -2,6 +2,35 @@
 
 The aggregator service collects metrics from multiple collector instances, enriches them with Kubernetes metadata, and stores the data in S3-compatible storage in Parquet format.
 
+## Production Server
+
+The aggregator uses **Waitress**, a production-ready pure-Python WSGI server that provides:
+
+- **Single-process architecture** - No multi-process complexity
+- **Thread-based concurrency** - 4 worker threads by default
+- **Connection pooling** - Up to 1000 simultaneous connections
+- **Timeout management** - Automatic cleanup of stale connections
+- **Memory efficiency** - Lower memory footprint than multi-process servers
+- **Signal handling** - Graceful shutdown support
+
+### Server Configuration
+
+The server is configured in `server_config.py` with production-optimized settings:
+
+```python
+WAITRESS_CONFIG = {
+    "host": "0.0.0.0",
+    "port": 8888,
+    "threads": 4,
+    "connection_limit": 1000,
+    "cleanup_interval": 30,
+    "channel_timeout": 120,
+    "max_request_body_size": 1073741824,  # 1GB
+    "expose_tracebacks": False,
+    "asyncore_use_poll": True,
+}
+```
+
 ## Configuration
 
 The aggregator can be configured using the following environment variables:

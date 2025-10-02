@@ -1,7 +1,7 @@
 kubernetes
 flask
 requests
-gunicorn
+waitress
 boto3
 pandas
 pyarrow
