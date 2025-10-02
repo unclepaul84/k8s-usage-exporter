@@ -128,6 +128,8 @@ def convert_to_parquet(payload):
                 "cluster_id": payload["cluster_id"],
                 "node_name": payload["node_name"],
                 "ec2_instance_id": payload["ec2_instance_id"],
+                "node_cpu_capacity_cores": payload.get("node_cpu_capacity_cores", 0),
+                "node_memory_capacity_bytes": payload.get("node_memory_capacity_bytes", 0),
                 "pod_name": pod.get("pod_name"),
                 "pod_id": pod.get("pod_id"),
                 "namespace": pod.get("namespace"),
@@ -356,7 +358,7 @@ def update_pod_cache(pod, operation="UNKNOWN"):
 
 def update_node_cache(node, operation="UNKNOWN"):
     """
-    Update the node cache with node metadata and EC2 information.
+    Update the node cache with node metadata, EC2 information, and capacity.
     
     Args:
         node: Kubernetes node object
@@ -378,9 +380,31 @@ def update_node_cache(node, operation="UNKNOWN"):
         # Extract cluster name from annotation
         cluster_name = annotations.get("cluster.x-k8s.io/cluster-name")
         
+        # Extract node capacity information
+        cpu_capacity_cores = 0
+        memory_capacity_bytes = 0
+        
+        if node.status and node.status.capacity:
+            capacity = node.status.capacity
+            # Parse CPU capacity (convert to cores to match cpu_usage_cores format)
+            cpu_str = capacity.get("cpu", "0")
+            if cpu_str.endswith("m"):
+                cpu_capacity_cores = parse_quantity(cpu_str) / 1000.0  # Convert millicores to cores
+            else:
+                cpu_capacity_cores = parse_quantity(cpu_str)  # Already in cores
+            
+            # Parse memory capacity
+            memory_str = capacity.get("memory", "0")
+            memory_capacity_bytes = parse_quantity(memory_str)
+            
+            if DEBUG_K8S_API:
+                logger.debug(f"Node {node_name} capacity: CPU={cpu_str} -> {cpu_capacity_cores} cores, Memory={memory_str} -> {memory_capacity_bytes} bytes")
+        
         node_cache[node_name] = {
             "ec2_instance_id": ec2_instance_id,
-            "cluster_name": cluster_name
+            "cluster_name": cluster_name,
+            "cpu_capacity_cores": cpu_capacity_cores,
+            "memory_capacity_bytes": memory_capacity_bytes
         }
         
         if DEBUG_K8S_API:
@@ -831,6 +855,8 @@ def create_app():
             "cluster_id": cluster_id,
             "node_name": node_name,
             "ec2_instance_id": ec2_instance_id,
+            "node_cpu_capacity_cores": node_info.get("cpu_capacity_cores", 0),
+            "node_memory_capacity_bytes": node_info.get("memory_capacity_bytes", 0),
             "pods": enriched_pods
         }
 
