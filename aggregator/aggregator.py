@@ -126,6 +126,7 @@ def convert_to_parquet(payload):
             record = {
                 "timestamp": payload["timestamp"],
                 "cluster_id": payload["cluster_id"],
+                "cluster_uid": payload.get("cluster_uid"),
                 "node_name": payload["node_name"],
                 "ec2_instance_id": payload["ec2_instance_id"],
                 "node_cpu_capacity_cores": payload.get("node_cpu_capacity_cores", 0),
@@ -226,6 +227,9 @@ node_cache = {}   # node_name → {ec2_instance_id, cluster_name}
 pvc_cache = {}    # pvc_uid → {namespace, name, storage_request_bytes, volume_name}
 pv_cache = {}     # pv_name → {aws_volume_id, storage_class}
 
+# Global cache for cluster UID
+cluster_uid_cache = None
+
 # Initialization flags for watch threads
 watch_initialized = {
     "nodes": False,
@@ -248,6 +252,41 @@ def parse_quantity(qty: str) -> int:
     if q.endswith("gi"):
         return int(q[:-2]) * 1024 * 1024 * 1024
     return int(q)
+
+def get_cluster_uid():
+    """
+    Get the UID from the kube-system namespace metadata to use as cluster_uid.
+    Returns None if unable to retrieve or if an error occurs.
+    """
+    global cluster_uid_cache
+    
+    # Return cached value if available
+    if cluster_uid_cache is not None:
+        return cluster_uid_cache
+    
+    try:
+        # Load Kubernetes configuration
+        config.load_incluster_config()
+        client.configuration.verify_ssl = False
+        v1 = client.CoreV1Api()
+        
+        # Get the kube-system namespace
+        namespace = v1.read_namespace(name="kube-system")
+        
+        if namespace and namespace.metadata and namespace.metadata.uid:
+            cluster_uid_cache = namespace.metadata.uid
+            logger.info(f"Successfully retrieved cluster_uid from kube-system namespace: {cluster_uid_cache}")
+            return cluster_uid_cache
+        else:
+            logger.warning("kube-system namespace metadata or UID not found")
+            return None
+            
+    except client.ApiException as e:
+        logger.error(f"Kubernetes API error while getting kube-system namespace: {e.status} - {e.reason}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error while getting cluster_uid from kube-system namespace: {e}")
+        return None
 
 def log_k8s_api_response(operation, obj_type, obj_name, event_type=None, full_object=None):
     """Log Kubernetes API response details when debug mode is enabled."""
@@ -762,6 +801,10 @@ def create_app():
     # Initialize S3 client
     initialize_s3_client()
     
+    # Initialize cluster UID cache early
+    logger.info("Initializing cluster UID from kube-system namespace...")
+    get_cluster_uid()
+    
     # Start background watchers when app is created
     start_background_watchers()
 
@@ -809,6 +852,9 @@ def create_app():
         if( cluster_id == "unknown" ):
             logger.warning(f"Cluster name not found in node annotations or environment variable. Please configure CLUSTER_NAME env var.")
         
+        # Get cluster UID from kube-system namespace
+        cluster_uid = get_cluster_uid()
+        
         enriched_pods = []
         for pod in payload.get("pods", []):
             uid = pod["pod_id"]
@@ -853,6 +899,7 @@ def create_app():
         enriched_payload = {
             "timestamp": payload["timestamp"],
             "cluster_id": cluster_id,
+            "cluster_uid": cluster_uid,
             "node_name": node_name,
             "ec2_instance_id": ec2_instance_id,
             "node_cpu_capacity_cores": node_info.get("cpu_capacity_cores", 0),
